@@ -25,6 +25,18 @@ class Scribe:
             }
         }
 
+        # Define static junk patterns and blacklists
+        self.pe_sections = {".text", ".rdata", ".data", ".pdata", ".rsrc", ".reloc", ".idata", ".debug", ".bss"}
+        self.junk_blacklist = [
+            "this program cannot be run in dos mode",
+            "microsoft", "rich", "kernel32", "user32", "msvcp", "vcruntime" # Too generic, filter via other means
+        ]
+        self.junk_blacklist_strong = [
+            "this program cannot be run in dos mode",
+            "rich", 
+            "0hrich"
+        ]
+
         self.setup_ui()
         self.apply_theme()
 
@@ -38,8 +50,6 @@ class Scribe:
 
         self.mode_frame = tk.Frame(self.nav_bar)
         self.mode_frame.pack(side=tk.LEFT, padx=20)
-        
-        # Added "Paths" mode here
         modes = [("Normal", 0), ("Strict", 1), ("ASM", 2), ("Paths", 3), ("URL", 4)]
         for text, val in modes:
             rb = ttk.Radiobutton(self.mode_frame, text=text, variable=self.analysis_mode, 
@@ -84,12 +94,59 @@ class Scribe:
         self.is_dark_mode.set(not self.is_dark_mode.get())
         self.apply_theme()
 
-    def fix_wide_strings(self, text):
-        """Fixes UTF-16 spacing (R.o.b.l.o.x -> Roblox)"""
-        if len(text) > 4:
-            if len(re.findall(r'[a-zA-Z0-9]\s', text)) > len(text) / 3:
+    # --- THE SENTINEL ENGINE (IMPROVED) ---
+
+    def fix_wide_text(self, text):
+        """Collapses H.y.t.h.e.r.a patterns into Hythera."""
+        if len(text) > 8:
+            spaced = re.findall(r'[a-zA-Z0-9][\s\x00]', text)
+            if len(spaced) > len(text) / 3:
                 return text.replace(" ", "").replace("\x00", "")
-        return text.strip()
+        return text
+
+    def is_real_word(self, text):
+        """Deep heuristic to kill WATAUAVAWH, PE headers, and binary register noise."""
+        clean = text.strip()
+        if len(clean) < 3: return False
+        
+        # 1. Hard Blocklist for specific known junk
+        clean_l = clean.lower()
+        for junk in self.junk_blacklist_strong:
+            if junk in clean_l:
+                return False
+
+        # 2. PE Section Headers (e.g. .text, .rdata)
+        if clean.startswith(".") or clean_l in self.pe_sections:
+            return False
+
+        # 3. MSVC Stack Frame Macros (e.g. USVAVAWH, SUVATAUAWH)
+        # These are uppercase strings composed only of U, V, W, A, H, S, T, X
+        if clean.isupper() and len(clean) > 4:
+            macro_chars = set("UVWAHSTX")
+            # If 90% of the chars are macro chars, it's garbage
+            if sum(1 for c in clean if c in macro_chars) / len(clean) > 0.8:
+                return False
+
+        # 4. Random Hex/Address noise (e.g. 0hRich, A^^][)
+        if re.match(r'^(0x|0h|[\^\\\[\]\(\)\$]+)', clean):
+            return False
+
+        # 5. Vowel and Consonant Logic
+        vowels = len(re.findall(r'[aeiouyAEIOUY]', clean))
+        
+        # Kill all-caps strings with 0 vowels (likely registers/macros) unless very short
+        if clean.isupper() and vowels == 0 and len(clean) > 3:
+            return False
+
+        # Consonant Clumping
+        if re.search(r'[^aeiouyAEIOUY\s]{5,}', clean):
+            return False
+
+        # Vowel Balance Check
+        if len(clean) > 4 and vowels / len(clean) < 0.15:
+            return False
+
+        return True
 
     def start_async_process(self):
         if self.is_processing: return
@@ -99,7 +156,7 @@ class Scribe:
 
     def process_data_engine(self):
         self.is_processing = True
-        self.lbl_status.config(text="SCANNING...")
+        self.lbl_status.config(text="SENTINEL SCANNING...")
         self.output_text.delete(1.0, tk.END)
         
         mode = self.analysis_mode.get()
@@ -111,47 +168,56 @@ class Scribe:
 
         results = []
         try:
+            source_str = str(source)
+            
             if mode == 0: # Normal
-                results = re.findall(r'[ -~]{4,}', str(source))
+                results = re.findall(r'[ -~]{4,}', source_str)
             
             elif mode == 1: # Strict
-                found = re.findall(r'[a-zA-Z0-9\s\.\:\/\-]{5,}', str(source))
-                results = [self.fix_wide_strings(x) for x in found if len(x.strip()) > 4]
+                lines = re.findall(r'[a-zA-Z0-9\s\.\:\/\-]{5,}', source_str)
+                for line in lines:
+                    fixed = self.fix_wide_text(line)
+                    # Check word by word to be precise
+                    words = fixed.split()
+                    valid_words = [w for w in words if self.is_real_word(w)]
+                    if valid_words:
+                        results.append(" ".join(valid_words))
             
-            elif mode == 2: # ASM
-                found = re.findall(r'[a-zA-Z\s]{8,}', str(source))
-                results = [x.strip() for x in found if len(set(x.lower())) > 3]
-
-            elif mode == 3: # PATHS MODE
-                # First heal the text to find spaced-out paths
-                clean_content = self.fix_wide_strings(str(source))
-                
-                # Broad Path Patterns
-                # 1. Windows: C:\... or \\Network\...
-                # 2. Linux: /usr/bin... or /etc/...
-                # 3. Common extensions: .exe, .dll, .txt, .log, .zip, .json, .xml
+            elif mode == 2: # ASM (Cleanest)
+                # Only letters and spaces. Force reconstruction first.
+                lines = re.findall(r'[a-zA-Z\s\x00]{8,}', source_str)
+                for line in lines:
+                    fixed = self.fix_wide_text(line)
+                    # GRANULAR FILTERING: Split line into words to detach junk from valid text
+                    words = fixed.split()
+                    valid_words = []
+                    for w in words:
+                        if self.is_real_word(w):
+                            valid_words.append(w)
+                    
+                    if valid_words:
+                        # Reassemble if we found valid words
+                        results.append(" ".join(valid_words))
+            
+            elif mode == 3: # Paths
+                fixed_source = self.fix_wide_text(source_str)
                 path_patterns = [
-                    r'[a-zA-Z]:\\[\w\s\.\-\\]+',      # Local Windows
-                    r'\\\\[\w\s\.\-\\]+',              # UNC / Network
-                    r'/(?:[\w\.\-]+/)+[\w\.\-]+',     # Linux Absolute
-                    r'[\w\s\.\-\\]+\.(?:exe|dll|sys|txt|log|json|xml|zip|rar|hpp|cpp|lua)', # File extensions
-                    r'\.\.?\\[\w\s\.\-\\]+'            # Relative paths (.\ or ..\)
+                    r'[a-zA-Z]:\\[\w\s\.\-\\]+\.\w+',
+                    r'/(?:[\w\.\-]+/)+[\w\.\-]+'
                 ]
-                
                 for p in path_patterns:
-                    found = re.findall(p, clean_content)
-                    results.extend(found)
+                    results.extend(re.findall(p, fixed_source))
 
             elif mode == 4: # URL
-                cleaned_source = self.fix_wide_strings(str(source))
+                fixed_source = self.fix_wide_text(source_str)
                 pattern = r'(?:https?://|ws?s://|www\.)[a-zA-Z0-9\-\.\/\?\=\&\%]+'
-                results = re.findall(pattern, cleaned_source, re.IGNORECASE)
+                results = re.findall(pattern, fixed_source, re.IGNORECASE)
 
-            # Cleanup duplicates and short junk
+            # Deduplication
             unique_results = []
             for r in results:
                 r = r.strip()
-                if len(r) > 4 and r not in unique_results:
+                if r not in unique_results and len(r) > 4:
                     unique_results.append(r)
 
             self.last_results = unique_results
@@ -162,10 +228,9 @@ class Scribe:
 
     def display_results_safe(self, results):
         preview = results[:5000]
-        output_str = "\n".join(preview)
+        self.output_text.insert(tk.END, "\n".join(preview))
         if len(results) > 5000:
-            output_str += f"\n\n... [TRUNCATED] Total items: {len(results)}. Save Report to view all."
-        self.output_text.insert(tk.END, output_str)
+            self.output_text.insert(tk.END, f"\n\n... [TRUNCATED] Total: {len(results)}. Save Report to view all.")
         self.btn_export.config(state="normal")
         self.lbl_status.config(text=f"DONE - Found {len(results)}")
 
@@ -183,7 +248,7 @@ class Scribe:
             
             self.raw_data_cache = "\n".join(combined)
             self.input_text.delete(1.0, tk.END)
-            self.input_text.insert(tk.END, f"[LOADED: {file_path}]")
+            self.input_text.insert(tk.END, f"[FILE: {file_path}]")
             self.start_async_process()
         except Exception as e:
             messagebox.showerror("Error", str(e))
