@@ -6,12 +6,13 @@ By treating files as raw data, SCRIBE bypasses common malware defenses such as A
 
 ## Key Features
 
-- **Multi-Mode Analysis**:
+- **Multiple modes for Analysis**:
   - **Normal**: View the binary file in minimal filtering might be better for more data incase others filter out important data
   - **Strict**: Filters out noise/symbols and automatically repairs "spaced-out" UTF-16
-  - **ASM (Aggressive Strict Mode)**: Strips everything except pure human-readable sentences and words.(needs improvements)
+  - **ASM (Aggressive Strict Mode)**: attempts to strip everything except pure human-readable sentences and words numbers etc.
   - **URLs**: Specifically looks for urls doesnt work well
   - **Paths**: Specifically looks for paths doent work well
+  - **UASM (Ultra aggressive strict mode)**: Uses a Massive(ltf) word list from a random school i found to filter the unreadable stuff and only show the readable stuff
 
 ## How to Use
 
