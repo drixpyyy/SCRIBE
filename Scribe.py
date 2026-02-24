@@ -1,264 +1,283 @@
 import tkinter as tk
-from tkinter import ttk, filedialog, scrolledtext, messagebox
+from tkinter import ttk, filedialog, messagebox
 import re
 import threading
+import os
 
 class Scribe:
     def __init__(self, root):
         self.root = root
         self.root.title("SCRIBE")
-        self.root.geometry("1150x850")
+        self.root.geometry("1200x900")
         
+        # Core State
         self.analysis_mode = tk.IntVar(value=0)
         self.is_dark_mode = tk.BooleanVar(value=True) 
         self.raw_data_cache = None 
+        self.full_binary_data = None
         self.is_processing = False
+        self.last_results = []
+        self.search_matches = []
+        self.current_match_idx = -1
+        
+        # Dictionary Cache
+        self.wordlist = set()
+        self.load_wordlist()
 
         self.themes = {
             "light": {
-                "bg": "#f5f5f7", "surface": "#ffffff", "text": "#1d1d1f", 
-                "accent": "#0071e3", "border": "#d2d2d7", "input_bg": "#ffffff"
+                "bg": "#f2f2f7", "nav": "#ffffff", "text": "#1c1c1e", 
+                "accent": "#007aff", "border": "#d1d1d6", "card": "#ffffff",
+                "hover": "#e5e5ea", "highlight": "#ffcc00"
             },
             "dark": {
-                "bg": "#121212", "surface": "#1e1e1e", "text": "#ffffff", 
-                "accent": "#0a84ff", "border": "#333333", "input_bg": "#252525"
+                "bg": "#000000", "nav": "#1c1c1e", "text": "#ffffff", 
+                "accent": "#0a84ff", "border": "#3a3a3c", "card": "#1c1c1e",
+                "hover": "#2c2c2e", "highlight": "#ff9500"
             }
         }
 
-        # Define static junk patterns and blacklists
-        self.pe_sections = {".text", ".rdata", ".data", ".pdata", ".rsrc", ".reloc", ".idata", ".debug", ".bss"}
-        self.junk_blacklist = [
-            "this program cannot be run in dos mode",
-            "microsoft", "rich", "kernel32", "user32", "msvcp", "vcruntime" # Too generic, filter via other means
-        ]
-        self.junk_blacklist_strong = [
-            "this program cannot be run in dos mode",
-            "rich", 
-            "0hrich"
-        ]
-
         self.setup_ui()
         self.apply_theme()
+        
+        self.root.bind("<Control-f>", lambda e: self.search_entry.focus_set())
+        self.search_entry.bind("<Return>", lambda e: self.jump_to_next_match())
+
+    def load_wordlist(self):
+        """Loads the ASMFilter.txt into a high-speed set."""
+        try:
+            path = os.path.join(os.path.dirname(__file__), "ASMFilter.txt")
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    self.wordlist = set(line.strip().lower() for line in f if len(line.strip()) > 1)
+            else:
+                print("ASMFilter.txt not found.")
+        except Exception as e:
+            print(f"Error loading wordlist: {e}")
 
     def setup_ui(self):
-        self.nav_bar = tk.Frame(self.root, height=70, bd=0, highlightthickness=1)
+        # --- Nav Bar ---
+        self.nav_bar = tk.Frame(self.root, height=80, bd=0, highlightthickness=1)
         self.nav_bar.pack(side=tk.TOP, fill=tk.X)
         self.nav_bar.pack_propagate(False)
 
-        self.lbl_title = tk.Label(self.nav_bar, text="SCRIBE", font=("Segoe UI", 18, "bold"))
-        self.lbl_title.pack(side=tk.LEFT, padx=30)
+        self.lbl_title = tk.Label(self.nav_bar, text="SCRIBE", font=("Inter", 20, "bold"))
+        self.lbl_title.pack(side=tk.LEFT, padx=40)
 
+        # Search
+        search_container = tk.Frame(self.nav_bar)
+        search_container.pack(side=tk.RIGHT, padx=30)
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *args: self.perform_highlight())
+        self.search_entry = tk.Entry(search_container, textvariable=self.search_var, font=("Inter", 10), bd=0, highlightthickness=1, width=25)
+        self.search_entry.pack(side=tk.LEFT, ipady=3)
+
+        # Modes Group
         self.mode_frame = tk.Frame(self.nav_bar)
-        self.mode_frame.pack(side=tk.LEFT, padx=20)
-        modes = [("Normal", 0), ("Strict", 1), ("ASM", 2), ("Paths", 3), ("URL", 4)]
+        self.mode_frame.pack(side=tk.LEFT, padx=10)
+        
+        modes = [("Normal", 0), ("Strict", 1), ("ASM", 2), ("UASM", 6), ("Paths", 3), ("URL", 4), ("Game", 5)]
         for text, val in modes:
-            rb = ttk.Radiobutton(self.mode_frame, text=text, variable=self.analysis_mode, 
-                                 value=val, command=self.start_async_process)
-            rb.pack(side=tk.LEFT, padx=10)
+            rb = tk.Radiobutton(self.mode_frame, text=text, variable=self.analysis_mode, value=val, 
+                                command=self.start_async_process, font=("Inter", 9), 
+                                indicatoron=0, bd=0, padx=10, pady=4, relief="flat")
+            rb.pack(side=tk.LEFT, padx=1)
+            self.style_rb(rb)
 
         self.btn_frame = tk.Frame(self.nav_bar)
-        self.btn_frame.pack(side=tk.RIGHT, padx=20)
-        self.btn_export = tk.Button(self.btn_frame, text="Save Report", command=self.save_to_file, relief="flat", padx=10, state="disabled")
-        self.btn_export.pack(side=tk.LEFT, padx=5)
-        self.btn_theme = tk.Button(self.btn_frame, text="Theme", command=self.toggle_theme, relief="flat", padx=10)
-        self.btn_theme.pack(side=tk.LEFT, padx=5)
-        self.btn_load = tk.Button(self.btn_frame, text="Open File", command=self.load_file, fg="white", bg="#0071e3", relief="flat", padx=15, font=("Segoe UI", 9, "bold"))
+        self.btn_frame.pack(side=tk.RIGHT, padx=10)
+        self.btn_load = self.create_btn(self.btn_frame, "Open File", self.load_file, is_primary=True)
         self.btn_load.pack(side=tk.LEFT, padx=5)
+        self.btn_export = self.create_btn(self.btn_frame, "Export", self.save_to_file)
+        self.btn_export.pack(side=tk.LEFT, padx=2)
+        self.btn_theme = self.create_btn(self.btn_frame, "◐", self.toggle_theme)
+        self.btn_theme.pack(side=tk.LEFT, padx=2)
 
         self.main_content = tk.Frame(self.root)
-        self.main_content.pack(expand=True, fill=tk.BOTH, padx=40, pady=20)
-        self.lbl_status = tk.Label(self.main_content, text="Ready", font=("Segoe UI", 8))
-        self.lbl_status.pack(anchor=tk.E)
-        self.input_text = tk.Text(self.main_content, height=6, font=("Consolas", 10), bd=0, highlightthickness=1)
-        self.input_text.pack(fill=tk.X, pady=(0, 20))
-        self.lbl_output = tk.Label(self.main_content, text="EXTRACTED", font=("Segoe UI", 8, "bold"))
-        self.lbl_output.pack(anchor=tk.W, pady=(0,5))
-        self.output_text = scrolledtext.ScrolledText(self.main_content, font=("Consolas", 11), bd=0, highlightthickness=1, padx=10, pady=10)
-        self.output_text.pack(expand=True, fill=tk.BOTH)
+        self.main_content.pack(expand=True, fill=tk.BOTH, padx=50, pady=30)
+        self.lbl_status = tk.Label(self.main_content, text="Ready", font=("Inter", 9))
+        self.lbl_status.pack(anchor=tk.E, pady=(0,5))
 
-    def apply_theme(self):
-        t = self.themes["dark"] if self.is_dark_mode.get() else self.themes["light"]
-        self.root.configure(bg=t["bg"])
-        self.nav_bar.configure(bg=t["surface"], highlightbackground=t["border"])
-        self.lbl_title.configure(bg=t["surface"], fg=t["text"])
-        self.mode_frame.configure(bg=t["surface"])
-        self.btn_frame.configure(bg=t["surface"])
-        self.main_content.configure(bg=t["bg"])
-        self.lbl_output.configure(bg=t["bg"], fg=t["accent"])
-        self.input_text.configure(bg=t["input_bg"], fg=t["text"], highlightbackground=t["border"], insertbackground=t["text"])
-        self.output_text.configure(bg=t["input_bg"], fg=t["text"], highlightbackground=t["border"], insertbackground=t["text"])
-        self.btn_theme.configure(bg=t["border"], fg=t["text"])
-        self.lbl_status.configure(bg=t["bg"], fg=t["text"])
+        self.input_text = tk.Text(self.main_content, height=4, font=("Consolas", 10), bd=0, highlightthickness=1)
+        self.input_text.pack(fill=tk.X, pady=(0, 15))
 
-    def toggle_theme(self):
-        self.is_dark_mode.set(not self.is_dark_mode.get())
-        self.apply_theme()
+        out_container = tk.Frame(self.main_content, highlightthickness=1)
+        out_container.pack(expand=True, fill=tk.BOTH)
+        self.output_text = tk.Text(out_container, font=("Consolas", 12), bd=0, padx=15, pady=15, wrap=tk.NONE, undo=False)
+        sy = tk.Scrollbar(out_container, orient=tk.VERTICAL, command=self.output_text.yview)
+        sx = tk.Scrollbar(out_container, orient=tk.HORIZONTAL, command=self.output_text.xview)
+        self.output_text.configure(yscrollcommand=sy.set, xscrollcommand=sx.set)
+        sy.pack(side=tk.RIGHT, fill=tk.Y); sx.pack(side=tk.BOTTOM, fill=tk.X); self.output_text.pack(side=tk.LEFT, expand=True, fill=tk.BOTH)
+        self.output_text.tag_configure("find", background="#ff9500", foreground="black")
 
-    # --- THE SENTINEL ENGINE (IMPROVED) ---
+    def perform_highlight(self):
+        self.output_text.tag_remove("find", "1.0", tk.END)
+        query = self.search_var.get()
+        if not query: return
+        start = "1.0"
+        while True:
+            start = self.output_text.search(query, start, stopindex=tk.END, nocase=True)
+            if not start: break
+            end = f"{start}+{len(query)}c"
+            self.output_text.tag_add("find", start, end); start = end
+
+    def jump_to_next_match(self):
+        query = self.search_var.get()
+        if not query: return
+        matches = []; start = "1.0"
+        while True:
+            pos = self.output_text.search(query, start, stopindex=tk.END, nocase=True)
+            if not pos: break
+            matches.append(pos); start = f"{pos}+{len(query)}c"
+        if not matches:
+            messagebox.showinfo("Scribe Search", f"No results found for '{query}'")
+            return
+        self.current_match_idx += 1
+        if self.current_match_idx >= len(matches): self.current_match_idx = 0
+        target_pos = matches[self.current_match_idx]
+        self.output_text.see(target_pos); self.output_text.tag_add("sel", target_pos, f"{target_pos}+{len(query)}c")
 
     def fix_wide_text(self, text):
-        """Collapses H.y.t.h.e.r.a patterns into Hythera."""
-        if len(text) > 8:
-            spaced = re.findall(r'[a-zA-Z0-9][\s\x00]', text)
-            if len(spaced) > len(text) / 3:
-                return text.replace(" ", "").replace("\x00", "")
-        return text
+        if len(text) > 6 and (" " in text or "\x00" in text):
+            pattern = re.findall(r'[a-zA-Z0-9][\s\x00]', text)
+            if len(pattern) > len(text) / 3:
+                text = text.replace(" ", "").replace("\x00", "")
+        return "".join(i for i in text if 31 < ord(i) < 127).strip()
 
-    def is_real_word(self, text):
-        """Deep heuristic to kill WATAUAVAWH, PE headers, and binary register noise."""
+    def is_real_word(self, text, mode):
         clean = text.strip()
-        if len(clean) < 3: return False
+        if len(clean) < 4: return False
         
-        # 1. Hard Blocklist for specific known junk
-        clean_l = clean.lower()
-        for junk in self.junk_blacklist_strong:
-            if junk in clean_l:
-                return False
+        # Kill register prefixes (e.g., IUSVAVAWH -> USVAVAWH)
+        if len(clean) > 8 and clean[0] in "IUPX" and clean[1:].isupper():
+            clean = clean[1:]
 
-        # 2. PE Section Headers (e.g. .text, .rdata)
-        if clean.startswith(".") or clean_l in self.pe_sections:
-            return False
+        if mode == 6: # UASM
+            if not self.wordlist: return False
+            words = clean.lower().split()
+            matches = [w for w in words if w in self.wordlist]
+            return len(matches) / len(words) >= 0.5
 
-        # 3. MSVC Stack Frame Macros (e.g. USVAVAWH, SUVATAUAWH)
-        # These are uppercase strings composed only of U, V, W, A, H, S, T, X
-        if clean.isupper() and len(clean) > 4:
-            macro_chars = set("UVWAHSTX")
-            # If 90% of the chars are macro chars, it's garbage
-            if sum(1 for c in clean if c in macro_chars) / len(clean) > 0.8:
-                return False
-
-        # 4. Random Hex/Address noise (e.g. 0hRich, A^^][)
-        if re.match(r'^(0x|0h|[\^\\\[\]\(\)\$]+)', clean):
-            return False
-
-        # 5. Vowel and Consonant Logic
-        vowels = len(re.findall(r'[aeiouyAEIOUY]', clean))
-        
-        # Kill all-caps strings with 0 vowels (likely registers/macros) unless very short
-        if clean.isupper() and vowels == 0 and len(clean) > 3:
-            return False
-
-        # Consonant Clumping
-        if re.search(r'[^aeiouyAEIOUY\s]{5,}', clean):
-            return False
-
-        # Vowel Balance Check
-        if len(clean) > 4 and vowels / len(clean) < 0.15:
-            return False
-
+        if mode == 2: # ASM
+            if clean.isupper() and len(clean) > 5:
+                v = len(re.findall(r'[AEIOUY]', clean))
+                if v / len(clean) < 0.25: return False
+                if any(clean.startswith(x) for x in ["WATA", "UVWA", "UATA", "VWAU", "USVW"]): return False
+            if re.search(r'[^aeiouyAEIOUY\s]{5,}', clean): return False
+            if len(re.findall(r'[aeiouyAEIOUY]', clean)) == 0: return False
         return True
 
     def start_async_process(self):
         if self.is_processing: return
-        thread = threading.Thread(target=self.process_data_engine)
-        thread.daemon = True
-        thread.start()
+        self.output_text.delete(1.0, tk.END); self.current_match_idx = -1; self.apply_mode_visuals()
+        thread = threading.Thread(target=self.process_data_engine); thread.daemon = True; thread.start()
 
     def process_data_engine(self):
         self.is_processing = True
-        self.lbl_status.config(text="SENTINEL SCANNING...")
-        self.output_text.delete(1.0, tk.END)
-        
+        self.root.after(0, lambda: self.lbl_status.config(text="RECONSTRUCTING..."))
         mode = self.analysis_mode.get()
         source = self.raw_data_cache if self.raw_data_cache else self.input_text.get(1.0, tk.END)
-        
-        if not source or len(str(source).strip()) < 5:
-            self.is_processing = False
-            return
+        if not source or len(str(source).strip()) < 5: self.is_processing = False; return
 
         results = []
         try:
-            source_str = str(source)
-            
-            if mode == 0: # Normal
-                results = re.findall(r'[ -~]{4,}', source_str)
-            
-            elif mode == 1: # Strict
-                lines = re.findall(r'[a-zA-Z0-9\s\.\:\/\-]{5,}', source_str)
-                for line in lines:
-                    fixed = self.fix_wide_text(line)
-                    # Check word by word to be precise
-                    words = fixed.split()
-                    valid_words = [w for w in words if self.is_real_word(w)]
-                    if valid_words:
-                        results.append(" ".join(valid_words))
-            
-            elif mode == 2: # ASM (Cleanest)
-                # Only letters and spaces. Force reconstruction first.
-                lines = re.findall(r'[a-zA-Z\s\x00]{8,}', source_str)
-                for line in lines:
-                    fixed = self.fix_wide_text(line)
-                    # GRANULAR FILTERING: Split line into words to detach junk from valid text
-                    words = fixed.split()
-                    valid_words = []
-                    for w in words:
-                        if self.is_real_word(w):
-                            valid_words.append(w)
-                    
-                    if valid_words:
-                        # Reassemble if we found valid words
-                        results.append(" ".join(valid_words))
-            
-            elif mode == 3: # Paths
-                fixed_source = self.fix_wide_text(source_str)
-                path_patterns = [
-                    r'[a-zA-Z]:\\[\w\s\.\-\\]+\.\w+',
-                    r'/(?:[\w\.\-]+/)+[\w\.\-]+'
-                ]
-                for p in path_patterns:
-                    results.extend(re.findall(p, fixed_source))
-
-            elif mode == 4: # URL
-                fixed_source = self.fix_wide_text(source_str)
+            cleaned_source = self.fix_wide_text(str(source))
+            if mode == 0: results = re.findall(r'[ -~]{4,}', str(source))
+            elif mode == 1: 
+                lines = re.findall(r'[a-zA-Z0-9\s\.\:\/\-\_]{5,}', cleaned_source)
+                results = [x.strip() for x in lines if self.is_real_word(x, 1)]
+            elif mode == 2 or mode == 6: # ASM or UASM
+                lines = re.findall(r'[a-zA-Z\s]{8,}', cleaned_source)
+                results = [x.strip() for x in lines if self.is_real_word(x, mode)]
+            elif mode == 3: 
+                path_patterns = [r'[a-zA-Z]:\\[\w\s\.\-\\]+\.\w+', r'/(?:[\w\.\-]+/)+[\w\.\-]+']
+                for p in path_patterns: results.extend(re.findall(p, cleaned_source))
+            elif mode == 4: 
                 pattern = r'(?:https?://|ws?s://|www\.)[a-zA-Z0-9\-\.\/\?\=\&\%]+'
-                results = re.findall(pattern, fixed_source, re.IGNORECASE)
+                results = re.findall(pattern, cleaned_source, re.IGNORECASE)
+            elif mode == 5: # GAME MODE (Renamed from Offsets)
+                game_keywords = ["Ammo", "Health", "Gravity", "Jump", "Speed", "Recoil", "FOV", "ESP", "LocalPlayer", "Entity", "Vector", "Matrix", "Offset", "Pointer", "Position", "Rotation", "Scale", "float", "int32", "Multiplier", "Factor", "Amount", "Count", "get_", "set_"]
+                lines = cleaned_source.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    has_hex = re.search(r'0[xX][0-9a-fA-F]+', line)
+                    has_keyword = any(k.lower() in line.lower() for k in game_keywords)
+                    if has_hex or has_keyword:
+                        meta_info = ""
+                        if self.full_binary_data:
+                            target_b = line.encode('ascii', errors='ignore')
+                            idx = self.full_binary_data.find(target_b)
+                            if idx > 4:
+                                prefix = self.full_binary_data[idx-4:idx]
+                                if prefix[2] == 0x00: meta_info = f"[ID: 0x{prefix[1:2].hex().upper()}{prefix[0:1].hex().upper()}] "
+                        # Clip at random unicode block
+                        safe_line = re.split(r'[^\x20-\x7E]{2,}', line)[0]
+                        if len(safe_line.strip()) > 3: results.append(f"{meta_info}{safe_line}")
 
-            # Deduplication
-            unique_results = []
-            for r in results:
-                r = r.strip()
-                if r not in unique_results and len(r) > 4:
-                    unique_results.append(r)
+            self.last_results = list(dict.fromkeys(results))
+            self.root.after(0, lambda: self.batch_insert(0))
+        except Exception as e: print(f"Error: {e}")
 
-            self.last_results = unique_results
-            self.display_results_safe(unique_results)
-        except Exception as e:
-            print(f"Error: {e}")
-        self.is_processing = False
+    def batch_insert(self, index):
+        batch_size = 60; next_index = index + batch_size
+        chunk = "\n".join(self.last_results[index:next_index])
+        if chunk:
+            self.output_text.insert(tk.END, chunk + "\n")
+            progress = int((index / len(self.last_results)) * 100)
+            self.lbl_status.config(text=f"Loading: {progress}%"); self.root.after(5, lambda: self.batch_insert(next_index))
+        else:
+            self.lbl_status.config(text=f"DONE - {len(self.last_results)} items"); self.btn_export.config(state="normal"); self.is_processing = False
+            self.perform_highlight()
 
-    def display_results_safe(self, results):
-        preview = results[:5000]
-        self.output_text.insert(tk.END, "\n".join(preview))
-        if len(results) > 5000:
-            self.output_text.insert(tk.END, f"\n\n... [TRUNCATED] Total: {len(results)}. Save Report to view all.")
-        self.btn_export.config(state="normal")
-        self.lbl_status.config(text=f"DONE - Found {len(results)}")
+    def create_btn(self, parent, text, cmd, is_primary=False):
+        btn = tk.Button(parent, text=text, command=cmd, relief="flat", bd=0, padx=15, pady=6, font=("Inter", 9, "bold"))
+        return btn
+
+    def style_rb(self, rb):
+        def on_hover(e): 
+            if self.analysis_mode.get() != int(rb['value']): rb.configure(bg=self.themes[self.get_mode()]["hover"])
+        def on_leave(e): self.apply_mode_visuals()
+        rb.bind("<Enter>", on_hover); rb.bind("<Leave>", on_leave)
+
+    def get_mode(self): return "dark" if self.is_dark_mode.get() else "light"
+
+    def apply_theme(self):
+        t = self.themes[self.get_mode()]; self.root.configure(bg=t["bg"])
+        for w in [self.nav_bar, self.lbl_title, self.mode_frame, self.btn_frame]: w.configure(bg=t["nav"])
+        self.lbl_title.configure(fg=t["text"]); self.main_content.configure(bg=t["bg"]); self.lbl_status.configure(bg=t["bg"], fg="#8e8e93")
+        self.input_text.configure(bg=t["card"], fg=t["text"], highlightbackground=t["border"], insertbackground=t["text"])
+        self.output_text.configure(bg=t["card"], fg=t["text"], insertbackground=t["text"]); self.output_text.master.configure(highlightbackground=t["border"])
+        self.search_entry.configure(bg=t["card"], fg=t["text"], highlightbackground=t["border"]); self.btn_load.configure(bg=t["accent"], fg="white")
+        self.btn_export.configure(bg=t["nav"], fg=t["text"]); self.btn_theme.configure(bg=t["nav"], fg=t["text"])
+        self.output_text.tag_configure("find", background=t["highlight"], foreground="black"); self.apply_mode_visuals()
+
+    def apply_mode_visuals(self):
+        t = self.themes[self.get_mode()]
+        for child in self.mode_frame.winfo_children():
+            if isinstance(child, tk.Radiobutton):
+                if self.analysis_mode.get() == int(child['value']): child.configure(bg=t["accent"], fg="white")
+                else: child.configure(bg=t["nav"], fg=t["text"])
+
+    def toggle_theme(self): self.is_dark_mode.set(not self.is_dark_mode.get()); self.apply_theme()
 
     def load_file(self):
         file_path = filedialog.askopenfilename()
         if not file_path: return
-        self.lbl_status.config(text="LOADING...")
         try:
-            with open(file_path, 'rb') as f:
-                data = f.read()
-            ascii_s = re.findall(b'[ -~]{4,}', data)
-            wide_s = re.findall(b'(?:[\x20-\x7E]\x00){4,}', data)
+            with open(file_path, 'rb') as f: self.full_binary_data = f.read()
+            ascii_s = re.findall(b'[ -~]{4,}', self.full_binary_data)
+            wide_s = re.findall(b'(?:[\x20-\x7E]\x00){4,}', self.full_binary_data)
             combined = [s.decode('ascii', errors='ignore') for s in ascii_s]
             combined += [s.decode('utf-16le', errors='ignore') for s in wide_s]
-            
             self.raw_data_cache = "\n".join(combined)
-            self.input_text.delete(1.0, tk.END)
-            self.input_text.insert(tk.END, f"[FILE: {file_path}]")
-            self.start_async_process()
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+            self.input_text.delete(1.0, tk.END); self.input_text.insert(tk.END, f"[FILE: {file_path}]"); self.start_async_process()
+        except Exception as e: messagebox.showerror("Error", str(e))
 
     def save_to_file(self):
-        if not hasattr(self, 'last_results'): return
+        if not self.last_results: return
         file_path = filedialog.asksaveasfilename(defaultextension=".txt")
         if file_path:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write("\n".join(self.last_results))
+            with open(file_path, 'w', encoding='utf-8') as f: f.write("\n".join(self.last_results))
             messagebox.showinfo("Success", "Report saved.")
 
 if __name__ == "__main__":
